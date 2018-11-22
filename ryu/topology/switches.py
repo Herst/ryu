@@ -506,11 +506,13 @@ class Switches(app_manager.RyuApp):
     DEFAULT_TTL = 120  # unused. ignored.
     LLDP_PACKET_LEN = len(LLDPPacket.lldp_packet(0, 0, DONTCARE_STR, 0))
 
-    LLDP_SEND_GUARD = .05
-    LLDP_SEND_PERIOD_PER_PORT = .9
+    LLDP_SEND_GUARD = 1 # .05
+    LLDP_SEND_PERIOD_PER_PORT = 3600 #.9
     TIMEOUT_CHECK_PERIOD = 5.
     LINK_TIMEOUT = TIMEOUT_CHECK_PERIOD * 2
     LINK_LLDP_DROP = 5
+
+    LLDP_FLOW_COOKIE = 0x20000000000011D9
 
     def __init__(self, *args, **kwargs):
         super(Switches, self).__init__(*args, **kwargs)
@@ -596,6 +598,53 @@ class Switches(app_manager.RyuApp):
 
         return True
 
+    @set_ev_cls(ofp_event.EventOFPPortStateChange,
+                [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def port_state_change_handler(self, ev):
+        dp = ev.datapath
+        assert dp is not None
+        LOG.debug(dp)
+
+        ev.state = MAIN_DISPATCHER
+        self.install_flow = True
+        if self.install_flow:
+            ofproto = dp.ofproto
+            ofproto_parser = dp.ofproto_parser
+
+            # TODO:XXX need other versions
+            if ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
+                rule = nx_match.ClsRule()
+                rule.set_dl_dst(addrconv.mac.text_to_bin(
+                                lldp.LLDP_MAC_NEAREST_BRIDGE))
+                rule.set_dl_type(ETH_TYPE_LLDP)
+                actions = [ofproto_parser.OFPActionOutput(
+                    ofproto.OFPP_CONTROLLER, self.LLDP_PACKET_LEN)]
+                dp.send_flow_mod(
+                    rule=rule, cookie=self.LLDP_FLOW_COOKIE,
+                    command=ofproto.OFPFC_ADD, idle_timeout=0,
+                    hard_timeout=0, actions=actions, priority=0xFFFF)
+            elif ofproto.OFP_VERSION >= ofproto_v1_2.OFP_VERSION:
+                match = ofproto_parser.OFPMatch(
+                    eth_type=ETH_TYPE_LLDP,
+                    eth_dst=lldp.LLDP_MAC_NEAREST_BRIDGE)
+                # OFPCML_NO_BUFFER is set so that the LLDP is not
+                # buffered on switch
+                parser = ofproto_parser
+                actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                                  ofproto.OFPCML_NO_BUFFER
+                                                  )]
+                inst = [parser.OFPInstructionActions(
+                        ofproto.OFPIT_APPLY_ACTIONS, actions)]
+                mod = parser.OFPFlowMod(datapath=dp, match=match,
+                                        cookie=self.LLDP_FLOW_COOKIE,
+                                        idle_timeout=0, hard_timeout=0,
+                                        instructions=inst,
+                                        priority=0xFFFF)
+                dp.send_msg(mod)
+            else:
+                LOG.error('cannot install flow. unsupported version. %x',
+                          dp.ofproto.OFP_VERSION)
+
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def state_change_handler(self, ev):
@@ -636,9 +685,9 @@ class Switches(app_manager.RyuApp):
                     actions = [ofproto_parser.OFPActionOutput(
                         ofproto.OFPP_CONTROLLER, self.LLDP_PACKET_LEN)]
                     dp.send_flow_mod(
-                        rule=rule, cookie=0, command=ofproto.OFPFC_ADD,
-                        idle_timeout=0, hard_timeout=0, actions=actions,
-                        priority=0xFFFF)
+                        rule=rule, cookie=self.LLDP_FLOW_COOKIE,
+                        command=ofproto.OFPFC_ADD, idle_timeout=0,
+                        hard_timeout=0, actions=actions, priority=0xFFFF)
                 elif ofproto.OFP_VERSION >= ofproto_v1_2.OFP_VERSION:
                     match = ofproto_parser.OFPMatch(
                         eth_type=ETH_TYPE_LLDP,
@@ -652,6 +701,7 @@ class Switches(app_manager.RyuApp):
                     inst = [parser.OFPInstructionActions(
                             ofproto.OFPIT_APPLY_ACTIONS, actions)]
                     mod = parser.OFPFlowMod(datapath=dp, match=match,
+                                            cookie=self.LLDP_FLOW_COOKIE,
                                             idle_timeout=0, hard_timeout=0,
                                             instructions=inst,
                                             priority=0xFFFF)
@@ -788,7 +838,7 @@ class Switches(app_manager.RyuApp):
                       msg.datapath.ofproto.OFP_VERSION)
 
         src = self._get_port(src_dpid, src_port_no)
-        if not src or src.dpid == dst_dpid:
+        if not src: # or src.dpid == dst_dpid:
             return
         try:
             self.ports.lldp_received(src)
@@ -948,8 +998,8 @@ class Switches(app_manager.RyuApp):
                 self.send_lldp_packet(port)
                 hub.sleep(self.LLDP_SEND_GUARD)      # don't burst
 
-            if timeout is not None and ports:
-                timeout = 0     # We have already slept
+            #if timeout is not None and ports:
+            #    timeout = 0     # We have already slept
             # LOG.debug('lldp sleep %s', timeout)
             self.lldp_event.wait(timeout=timeout)
 
